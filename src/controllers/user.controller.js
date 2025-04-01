@@ -17,7 +17,17 @@ const registerUser = asyncHandler(async (req, res) => {
   // check for user creation
   // return response
 
-  const { fullName, email, username, password } = req.body;
+  const {
+    fullName,
+    email,
+    username,
+    password,
+    bio,
+    accountType,
+    phoneNumber,
+    link,
+    languagePreference,
+  } = req.body;
   //console.log("email: ", email);
 
   if (
@@ -64,6 +74,11 @@ const registerUser = asyncHandler(async (req, res) => {
     email,
     password,
     username: username.toLowerCase(),
+    bio,
+    accountType,
+    phoneNumber,
+    link,
+    languagePreference,
   });
 
   const createdUser = await User.findById(user._id).select(
@@ -408,7 +423,7 @@ const getUserChannelProfile = asyncHandler(async (req, res) => {
     );
 });
 
-const getWatchHistory = asyncHandler(async (req, res) => {
+const getHistory = asyncHandler(async (req, res) => {
   const user = await User.aggregate([
     {
       $match: {
@@ -456,7 +471,7 @@ const getWatchHistory = asyncHandler(async (req, res) => {
     .json(
       new ApiResponse(
         200,
-        user[0].watchHistory,
+        user[0].History,
         "Watch Hostory Fetched Successfully"
       )
     );
@@ -473,5 +488,5 @@ export {
   updateUserAvatar,
   updateUserCoverImage,
   getUserChannelProfile,
-  getWatchHistory,
+  getHistory,
 };

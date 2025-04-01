@@ -25,14 +25,29 @@ const userSchema = new Schema(
       trim: true,
       index: true, //search within the database
     },
-    email: {
+    avatar: {
       type: String, //cloudinary url
       required: true,
     },
     coverImage: {
       type: String, //cloudinary url
     },
-    watchHistory: [
+    bio: {
+      type: String,
+    },
+    accountType: {
+      type: String,
+    },
+    phoneNumber: {
+      type: String,
+    },
+    link: {
+      type: String,
+    },
+    languagePreference: {
+      type: String,
+    },
+    History: [
       {
         type: Schema.Types.ObjectId,
         ref: "Video",
