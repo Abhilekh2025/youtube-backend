@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+import mongoose, { Schema } from "mongoose";
 
 const mediaSchema = new Schema(
   {
@@ -57,14 +57,14 @@ const mediaSchema = new Schema(
           index: "2dsphere",
         },
       },
+      camera: { type: String },
+      iso: { type: Number },
+      aperture: { type: String },
+      shutterSpeed: { type: String },
+      focalLength: { type: String },
+      dateTaken: { type: Date },
+      isEdited: { type: Boolean },
     },
-    camera: String,
-    iso: Number,
-    aperture: String,
-    shutterSpeed: String,
-    focalLength: String,
-    dateTaken: Date,
-    isEdited: Boolean,
     filters: {
       applied: {
         type: String,
@@ -254,6 +254,7 @@ mediaSchema.methods = {
   },
 
   // Remove a user tag from the media
+
   removeUserTag: function (userId) {
     this.tags = this.tags.filter(
       (tagId) => tagId.toString() !== userId.toString()
