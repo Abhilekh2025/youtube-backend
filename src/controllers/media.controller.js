@@ -4,6 +4,7 @@ import { ApiError } from "../utils/ApiError.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import fs from "fs";
+import { isValidObjectId } from "mongoose";
 
 // Upload media file(s)
 const uploadMedia = asyncHandler(async (req, res) => {
@@ -144,6 +145,12 @@ const uploadMedia = asyncHandler(async (req, res) => {
 // Get media by ID
 const getMediaById = asyncHandler(async (req, res) => {
   const { mediaId } = req.params;
+
+  console.log("Media ID received:", mediaId);
+
+  if (!isValidObjectId(mediaId)) {
+    return res.status(400).json({ message: "Invalid media ID format" });
+  }
 
   if (!mediaId) {
     throw new ApiError(400, "Media ID is required");
@@ -390,7 +397,7 @@ const getMediaByLocation = asyncHandler(async (req, res) => {
   const {
     longitude,
     latitude,
-    distance = 1000,
+    distance = 100,
     limit = 20,
     page = 1,
   } = req.query;

@@ -8,7 +8,6 @@ import {
   toggleUserTag,
   deleteMedia,
   getMediaByLocation,
-  uploadMultipleMedia,
 } from "../controllers/media.controller.js";
 
 import { verifyJWT } from "../middlewares/auth.middleware.js";
@@ -22,7 +21,7 @@ router.route("/upload").post(verifyJWT, upload.array("media", 10), uploadMedia);
 // router
 //   .route("/upload/multiple")
 //   .post(verifyJWT, upload.array("media", 10), uploadMedia);
-router.route("/me").get(verifyJWT, getUserMedia);
+router.route("/userMedia").get(verifyJWT, getUserMedia);
 router.route("/location").get(verifyJWT, getMediaByLocation);
 router.route("/:mediaId").get(verifyJWT, getMediaById);
 router.route("/:mediaId").patch(verifyJWT, updateMedia);

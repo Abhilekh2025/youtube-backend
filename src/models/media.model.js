@@ -328,30 +328,53 @@ mediaSchema.statics = {
       .limit(limit);
   },
   // Get media nearby a location
-  getMediaNearLocation: function (
-    coordinates,
-    maxDistance = 1000,
-    options = {}
-  ) {
-    const { limit = 20, skip = 0 } = options;
+  // getMediaNearLocation: function (
+  //   coordinates,
+  //   maxDistance = 100,
+  //   options = {}
+  // ) {
+  //   const { limit = 20, skip = 0 } = options;
 
-    return this.find({
-      "metadata.location": {
-        $near: {
-          $geometry: {
+  //   return this.find({
+  //     "metadata.location": {
+  //       $near: {
+  //         $geometry: {
+  //           type: "Point",
+  //           coordinates: coordinates,
+  //         },
+  //         $maxDistance: maxDistance, // in meters
+  //       },
+  //     },
+  //     isDeleted: false,
+  //     isArchived: false,
+  //     "accessControl.isPublic": true,
+  //   })
+  //     .sort({ createdAt: -1 })
+  //     .skip(skip)
+  //     .limit(limit);
+  // },
+
+  async getMediaNearLocation(coordinates, maxDistance, options) {
+    return this.aggregate([
+      {
+        $geoNear: {
+          near: {
             type: "Point",
             coordinates: coordinates,
           },
-          $maxDistance: maxDistance, // in meters
+          distanceField: "distance",
+          maxDistance: maxDistance,
+          query: {
+            "accessControl.isPublic": true,
+            isArchived: false,
+            isDeleted: false,
+          },
+          spherical: true,
         },
       },
-      isDeleted: false,
-      isArchived: false,
-      "accessControl.isPublic": true,
-    })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+      { $skip: options.skip },
+      { $limit: options.limit },
+    ]);
   },
 };
 // Pre-save middleware to ensure proper storage path
