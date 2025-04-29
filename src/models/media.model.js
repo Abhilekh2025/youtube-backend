@@ -396,4 +396,4 @@ mediaSchema.pre("save", function (next) {
   next();
 });
 
-export const Media = mongoose.model("media", mediaSchema);
+export const Media = mongoose.model("Media", mediaSchema);
