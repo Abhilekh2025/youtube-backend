@@ -2663,4 +2663,2209 @@ const postController = {
       });
     }
   },
+
+  /**
+   * Get nearby posts
+   * @route GET /api/posts/nearby
+   * @access Public
+   */
+
+  getNearbyPosts: async (req, res) => {
+    try {
+      const { lat, lng, radius = 5 } = req.query; // radius in km
+      const visitorId = req.user ? req.user.id : null;
+
+      if (!lat || !lng) {
+        return res.status(400).json({
+          success: false,
+          message: "Latitude and longitude are required",
+        });
+      }
+
+      // Get pagination params
+      const { page = 1, limit = 12 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Search nearby posts
+      const posts = await Post.find({
+        isDeleted: false,
+        isArchived: false,
+        "accessControl.visibility": "public",
+        "publishingDetails.status": "published",
+        "location.coordinates": {
+          $near: {
+            $geometry: {
+              type: "Point",
+              coordinates: [parseFloat(lng), parseFloat(lat)],
+            },
+            $maxDistance: parseFloat(radius) * 1000, // convert km to meters
+          },
+        },
+      })
+        .sort({ "publishingDetails.publishedAt": -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .populate("user", "username profilePictureUrl isVerified")
+        .populate("media")
+        .populate("hashtags", "name")
+        .populate("categories", "name slug");
+
+      // Check which posts the visitor has liked (if authenticated)
+      const likedPostIds = new Set();
+
+      if (visitorId && posts.length > 0) {
+        const postIds = posts.map((post) => post._id);
+        const likes = await Like.find({
+          user: visitorId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each post
+      const postsWithLikeStatus = posts.map((post) => ({
+        ...post.toObject(),
+        isLiked: likedPostIds.has(post._id.toString()),
+      }));
+
+      // Calculate a rough estimate of total nearby posts
+      // For full production, this would need to be optimized
+      const totalEstimate =
+        posts.length === parseInt(limit)
+          ? (parseInt(page) + 1) * parseInt(limit)
+          : skip + posts.length;
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          estimatedTotal: totalEstimate,
+          hasMore: posts.length === parseInt(limit),
+        },
+        meta: {
+          location: {
+            lat: parseFloat(lat),
+            lng: parseFloat(lng),
+            radiusKm: parseFloat(radius),
+          },
+        },
+      });
+    } catch (error) {
+      console.error("Error getting nearby posts:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get nearby posts",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get post recommendations
+   * @route GET /api/posts/recommendations
+   * @access Private
+   */
+  getRecommendations: async (req, res) => {
+    try {
+      const userId = req.user.id;
+
+      // Get pagination params
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get user's interests and preferences
+      const user = await User.findById(userId).populate("interests");
+
+      const interestIds = user.interests
+        ? user.interests.map((interest) => interest._id)
+        : [];
+
+      // Get posts based on user's interests and behavior
+      const recommendations = await Post.getRecommendations(userId, {
+        interestIds,
+        limit: parseInt(limit),
+        skip,
+      });
+
+      // Check which posts the user has liked
+      const likedPostIds = new Set();
+
+      if (recommendations.length > 0) {
+        const postIds = recommendations.map((post) => post._id);
+        const likes = await Like.find({
+          user: userId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each post
+      const postsWithLikeStatus = recommendations.map((post) => ({
+        ...post.toObject(),
+        isLiked: likedPostIds.has(post._id.toString()),
+      }));
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          hasMore: recommendations.length === parseInt(limit),
+        },
+      });
+    } catch (error) {
+      console.error("Error getting post recommendations:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get post recommendations",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Process a batch of posts (for admin/moderation)
+   * @route POST /api/posts/batch-process
+   * @access Private (admin only)
+   */
+  batchProcessPosts: async (req, res) => {
+    try {
+      // Check admin role
+      if (req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to perform this action",
+        });
+      }
+
+      const { postIds, action, reason } = req.body;
+
+      if (!postIds || !Array.isArray(postIds) || postIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Post IDs are required",
+        });
+      }
+
+      if (
+        !["approve", "reject", "hide", "feature", "unfeature"].includes(action)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid action",
+        });
+      }
+
+      // Process batch of posts
+      const results = {
+        processed: 0,
+        failed: 0,
+        details: [],
+      };
+
+      for (const postId of postIds) {
+        try {
+          const post = await Post.findById(postId);
+
+          if (!post) {
+            results.failed++;
+            results.details.push({
+              postId,
+              success: false,
+              message: "Post not found",
+            });
+            continue;
+          }
+
+          switch (action) {
+            case "approve":
+              post.moderationStatus = "approved";
+              post.moderationDetails = {
+                moderatedBy: req.user.id,
+                moderatedAt: new Date(),
+                moderationNotes: reason || "Batch approved",
+              };
+              await post.save();
+              break;
+
+            case "reject":
+              post.moderationStatus = "rejected";
+              post.isHidden = true;
+              post.moderationDetails = {
+                moderatedBy: req.user.id,
+                moderatedAt: new Date(),
+                moderationNotes: reason || "Batch rejected",
+              };
+              await post.save();
+              break;
+
+            case "hide":
+              post.isHidden = true;
+              post.moderationDetails = {
+                moderatedBy: req.user.id,
+                moderatedAt: new Date(),
+                moderationNotes: reason || "Hidden by admin",
+              };
+              await post.save();
+              break;
+
+            case "feature":
+              post.isFeatured = true;
+              post.featuredDetails = {
+                featuredBy: req.user.id,
+                featuredAt: new Date(),
+                featuredReason: reason || "Featured by admin",
+              };
+              await post.save();
+              break;
+
+            case "unfeature":
+              post.isFeatured = false;
+              await post.save();
+              break;
+          }
+
+          results.processed++;
+          results.details.push({
+            postId,
+            success: true,
+            message: `Post ${action}d successfully`,
+          });
+        } catch (error) {
+          results.failed++;
+          results.details.push({
+            postId,
+            success: false,
+            message: error.message,
+          });
+        }
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Batch processed ${results.processed} posts with ${results.failed} failures`,
+        data: results,
+      });
+    } catch (error) {
+      console.error("Error in batch processing posts:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to process batch of posts",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get comment replies
+   * @route GET /api/posts/comments/:commentId/replies
+   * @access Public
+   */
+  getCommentReplies: async (req, res) => {
+    try {
+      const commentId = req.params.commentId;
+      const userId = req.user ? req.user.id : null;
+
+      // Check if comment exists
+      const comment = await Comment.findById(commentId);
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Get pagination params
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get replies
+      const replies = await Comment.find({
+        parentComment: commentId,
+        is_restricted: false,
+      })
+        .sort({ createdAt: 1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .populate("user", "username profilePictureUrl isVerified");
+
+      // Get total replies count
+      const totalReplies = await Comment.countDocuments({
+        parentComment: commentId,
+        is_restricted: false,
+      });
+
+      // Check which replies the user has liked (if authenticated)
+      const likedReplyIds = new Set();
+
+      if (userId && replies.length > 0) {
+        const replyIds = replies.map((reply) => reply._id);
+        const likes = await Like.find({
+          user: userId,
+          likeableType: "Comment",
+          likeableId: { $in: replyIds },
+        });
+
+        likes.forEach((like) => {
+          likedReplyIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each reply
+      const repliesWithLikeStatus = replies.map((reply) => ({
+        ...reply.toObject(),
+        isLiked: likedReplyIds.has(reply._id.toString()),
+      }));
+
+      res.status(200).json({
+        success: true,
+        data: repliesWithLikeStatus,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          totalReplies,
+          totalPages: Math.ceil(totalReplies / parseInt(limit)),
+          hasMore: skip + replies.length < totalReplies,
+        },
+      });
+    } catch (error) {
+      console.error("Error getting comment replies:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get comment replies",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Add a reply to a comment
+   * @route POST /api/posts/comments/:commentId/reply
+   * @access Private
+   */
+  replyToComment: async (req, res) => {
+    try {
+      // Validate request
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const commentId = req.params.commentId;
+      const userId = req.user.id;
+      const { content } = req.body;
+
+      // Check if comment exists
+      const comment = await Comment.findById(commentId);
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Check if this is already a reply to prevent nested replies
+      if (comment.parentComment) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Cannot reply to a reply. Please respond to the original comment.",
+        });
+      }
+
+      // Check if post exists and allows comments
+      const post = await Post.findById(comment.post);
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      if (post.accessControl && post.accessControl.allowComments === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Comments are disabled for this post",
+        });
+      }
+
+      // Create reply
+      const reply = await Comment.create({
+        user: userId,
+        post: comment.post,
+        content,
+        parentComment: commentId,
+        has_mentions: content.includes("@"),
+      });
+
+      // Increment reply count for the comment
+      comment.replies_count = (comment.replies_count || 0) + 1;
+      await comment.save();
+
+      // Process mentions if any
+      if (reply.has_mentions) {
+        // Extract usernames from content
+        const mentionRegex = /@(\w+)/g;
+        const mentions = [];
+        let match;
+
+        while ((match = mentionRegex.exec(content)) !== null) {
+          mentions.push(match[1]);
+        }
+
+        // Similar to comment mentions processing...
+      }
+
+      // Return reply with user data
+      const populatedReply = await Comment.findById(reply._id).populate(
+        "user",
+        "username profilePictureUrl isVerified"
+      );
+
+      res.status(201).json({
+        success: true,
+        message: "Reply added successfully",
+        data: populatedReply,
+      });
+    } catch (error) {
+      console.error("Error adding reply:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to add reply",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Like or unlike a comment
+   * @route POST /api/posts/comments/:commentId/like
+   * @access Private
+   */
+  toggleCommentLike: async (req, res) => {
+    try {
+      const commentId = req.params.commentId;
+      const userId = req.user.id;
+
+      // Check if comment exists
+      const comment = await Comment.findById(commentId);
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Toggle like
+      const like = await Like.findOne({
+        user: userId,
+        likeableType: "Comment",
+        likeableId: commentId,
+      });
+
+      let action;
+
+      if (like) {
+        // Unlike
+        await Like.findByIdAndDelete(like._id);
+
+        // Decrement like count
+        if (comment.likes_count > 0) {
+          comment.likes_count -= 1;
+          await comment.save();
+        }
+
+        action = "unliked";
+      } else {
+        // Like
+        await Like.create({
+          user: userId,
+          likeableType: "Comment",
+          likeableId: commentId,
+        });
+
+        // Increment like count
+        comment.likes_count = (comment.likes_count || 0) + 1;
+        await comment.save();
+
+        action = "liked";
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Comment ${action} successfully`,
+        data: {
+          action,
+          likesCount: comment.likes_count,
+        },
+      });
+    } catch (error) {
+      console.error("Error toggling comment like:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to toggle comment like",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Delete a comment
+   * @route DELETE /api/posts/comments/:commentId
+   * @access Private
+   */
+  deleteComment: async (req, res) => {
+    try {
+      const commentId = req.params.commentId;
+      const userId = req.user.id;
+
+      // Find comment
+      const comment = await Comment.findById(commentId);
+
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Check if user owns the comment or is admin
+      if (comment.user.toString() !== userId && req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to delete this comment",
+        });
+      }
+
+      // Delete comment
+      await Comment.findByIdAndDelete(commentId);
+
+      // Decrement post comment count
+      const post = await Post.findById(comment.post);
+      if (post && post.comments_count > 0) {
+        post.comments_count -= 1;
+        await post.save();
+      }
+
+      // If this is a reply, decrement parent comment's reply count
+      if (comment.parentComment) {
+        const parentComment = await Comment.findById(comment.parentComment);
+        if (parentComment && parentComment.replies_count > 0) {
+          parentComment.replies_count -= 1;
+          await parentComment.save();
+        }
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Comment deleted successfully",
+      });
+    } catch (error) {
+      console.error("Error deleting comment:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to delete comment",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Report a comment
+   * @route POST /api/posts/comments/:commentId/report
+   * @access Private
+   */
+  reportComment: async (req, res) => {
+    try {
+      // Validate request
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const commentId = req.params.commentId;
+      const userId = req.user.id;
+      const { reason, details } = req.body;
+
+      // Check if comment exists
+      const comment = await Comment.findById(commentId);
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Create report
+      const Report = mongoose.model("Report");
+      await Report.create({
+        reportedBy: userId,
+        reportedContent: {
+          contentType: "Comment",
+          contentId: commentId,
+        },
+        reason,
+        details,
+        status: "pending",
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Comment reported successfully. Our team will review it.",
+      });
+    } catch (error) {
+      console.error("Error reporting comment:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to report comment",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Edit a comment
+   * @route PUT /api/posts/comments/:commentId
+   * @access Private
+   */
+  editComment: async (req, res) => {
+    try {
+      // Validate request
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ success: false, errors: errors.array() });
+      }
+
+      const commentId = req.params.commentId;
+      const userId = req.user.id;
+      const { content } = req.body;
+
+      // Find comment and check ownership
+      const comment = await Comment.findById(commentId);
+
+      if (!comment) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Comment not found" });
+      }
+
+      // Check if user owns the comment
+      if (comment.user.toString() !== userId) {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to edit this comment",
+        });
+      }
+
+      // Check if edit window has passed (e.g., 30 minutes)
+      const editWindowMinutes = 30;
+      const editWindowMs = editWindowMinutes * 60 * 1000;
+      const commentAge = Date.now() - new Date(comment.createdAt).getTime();
+
+      if (commentAge > editWindowMs) {
+        return res.status(403).json({
+          success: false,
+          message: `Comments can only be edited within ${editWindowMinutes} minutes of posting`,
+        });
+      }
+
+      // Update comment
+      comment.content = content;
+      comment.isEdited = true;
+      comment.editedAt = new Date();
+      comment.has_mentions = content.includes("@");
+
+      await comment.save();
+
+      // Process mentions if any (similar to adding comment)
+
+      // Return updated comment
+      const updatedComment = await Comment.findById(commentId).populate(
+        "user",
+        "username profilePictureUrl isVerified"
+      );
+
+      res.status(200).json({
+        success: true,
+        message: "Comment updated successfully",
+        data: updatedComment,
+      });
+    } catch (error) {
+      console.error("Error editing comment:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to edit comment",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get featured posts
+   * @route GET /api/posts/featured
+   * @access Public
+   */
+  getFeaturedPosts: async (req, res) => {
+    try {
+      const visitorId = req.user ? req.user.id : null;
+
+      // Get pagination params
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get featured posts
+      const posts = await Post.find({
+        isDeleted: false,
+        isArchived: false,
+        isFeatured: true,
+        "accessControl.visibility": "public",
+        "publishingDetails.status": "published",
+      })
+        .sort({ "featuredDetails.featuredAt": -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .populate("user", "username profilePictureUrl isVerified")
+        .populate("media")
+        .populate("hashtags", "name")
+        .populate("categories", "name slug");
+
+      // Get total featured posts
+      const totalFeatured = await Post.countDocuments({
+        isDeleted: false,
+        isArchived: false,
+        isFeatured: true,
+        "accessControl.visibility": "public",
+        "publishingDetails.status": "published",
+      });
+
+      // Check which posts the visitor has liked (if authenticated)
+      const likedPostIds = new Set();
+
+      if (visitorId && posts.length > 0) {
+        const postIds = posts.map((post) => post._id);
+        const likes = await Like.find({
+          user: visitorId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each post
+      const postsWithLikeStatus = posts.map((post) => ({
+        ...post.toObject(),
+        isLiked: likedPostIds.has(post._id.toString()),
+      }));
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          totalFeatured,
+          totalPages: Math.ceil(totalFeatured / parseInt(limit)),
+          hasMore: skip + posts.length < totalFeatured,
+        },
+      });
+    } catch (error) {
+      console.error("Error getting featured posts:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get featured posts",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get post engagement metrics
+   * @route GET /api/posts/:id/engagement
+   * @access Private (owner only)
+   */
+  getPostEngagement: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const userId = req.user.id;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId);
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check ownership
+      if (post.user.toString() !== userId && req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to view these metrics",
+        });
+      }
+
+      // Get engagement metrics
+      const engagement = {
+        views: post.viewsCount || 0,
+        likes: post.likes_count || 0,
+        comments: post.comments_count || 0,
+        shares: post.shares_count || 0,
+        saves: post.saves_count || 0,
+      };
+
+      // Calculate engagement rate
+      const totalEngagements =
+        engagement.likes +
+        engagement.comments +
+        engagement.shares +
+        engagement.saves;
+
+      engagement.engagementRate =
+        engagement.views > 0 ? (totalEngagements / engagement.views) * 100 : 0;
+
+      // Format rate to 2 decimal places
+      engagement.engagementRate = parseFloat(
+        engagement.engagementRate.toFixed(2)
+      );
+
+      res.status(200).json({
+        success: true,
+        data: engagement,
+      });
+    } catch (error) {
+      console.error("Error getting post engagement:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get post engagement",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get post reach metrics
+   * @route GET /api/posts/:id/reach
+   * @access Private (owner only)
+   */
+  getPostReach: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const userId = req.user.id;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId);
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check ownership
+      if (post.user.toString() !== userId && req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to view these metrics",
+        });
+      }
+
+      // Get reach metrics from analytics collection
+      const Analytics = mongoose.model("Analytics");
+      const reach = await Analytics.findOne({
+        entityType: "Post",
+        entityId: postId,
+      });
+
+      // If no reach data exists, return zeros
+      const reachData = reach
+        ? {
+            uniqueViews: reach.uniqueVisitors || 0,
+            impressions: reach.impressions || 0,
+            referrers: reach.referrers || {},
+            deviceTypes: reach.deviceTypes || {},
+            demographicData: reach.demographics || {},
+          }
+        : {
+            uniqueViews: 0,
+            impressions: 0,
+            referrers: {},
+            deviceTypes: {},
+            demographicData: {},
+          };
+
+      res.status(200).json({
+        success: true,
+        data: reachData,
+      });
+    } catch (error) {
+      console.error("Error getting post reach:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get post reach",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Bulk status update for scheduled posts
+   * @route PUT /api/posts/bulk-status-update
+   * @access Private
+   */
+  bulkStatusUpdate: async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { postIds, status } = req.body;
+
+      if (!postIds || !Array.isArray(postIds) || postIds.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Post IDs are required",
+        });
+      }
+
+      if (!["published", "draft", "scheduled"].includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid status",
+        });
+      }
+
+      // Check if all posts belong to user
+      const posts = await Post.find({
+        _id: { $in: postIds },
+        user: userId,
+      });
+
+      if (posts.length !== postIds.length) {
+        return res.status(403).json({
+          success: false,
+          message: "One or more posts do not belong to you",
+        });
+      }
+
+      // Update status for each post
+      const updatePromises = posts.map(async (post) => {
+        post.publishingDetails.status = status;
+
+        if (status === "published") {
+          post.publishingDetails.publishedAt = new Date();
+        }
+
+        return post.save();
+      });
+
+      await Promise.all(updatePromises);
+
+      res.status(200).json({
+        success: true,
+        message: `Successfully updated ${posts.length} posts to ${status} status`,
+      });
+    } catch (error) {
+      console.error("Error in bulk status update:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to update post status",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get similar posts to a specific post
+   * @route GET /api/posts/:id/similar
+   * @access Public
+   */
+  getSimilarPosts: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const visitorId = req.user ? req.user.id : null;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get original post
+      const post = await Post.findById(postId)
+        .populate("hashtags", "_id")
+        .populate("categories", "_id");
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Extract IDs for matching
+      const hashtagIds = post.hashtags.map((tag) => tag._id);
+      const categoryIds = post.categories.map((cat) => cat._id);
+
+      // Get limit
+      const limit = parseInt(req.query.limit) || 6;
+
+      // Find similar posts
+      const similarPosts = await Post.getSimilarPosts(post, {
+        hashtagIds,
+        categoryIds,
+        limit,
+      });
+
+      // Check which posts the visitor has liked (if authenticated)
+      const likedPostIds = new Set();
+
+      if (visitorId && similarPosts.length > 0) {
+        const postIds = similarPosts.map((post) => post._id);
+        const likes = await Like.find({
+          user: visitorId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each post
+      const postsWithLikeStatus = similarPosts.map((post) => ({
+        ...post.toObject(),
+        isLiked: likedPostIds.has(post._id.toString()),
+      }));
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+      });
+    } catch (error) {
+      console.error("Error getting similar posts:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get similar posts",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get viral or rapidly growing posts
+   * @route GET /api/posts/viral
+   * @access Public
+   */
+  getViralPosts: async (req, res) => {
+    try {
+      const visitorId = req.user ? req.user.id : null;
+
+      // Get time window
+      const { timeWindow = 24 } = req.query; // hours
+
+      // Get pagination params
+      const { page = 1, limit = 10 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get viral posts
+      const posts = await Post.getViralPosts({
+        timeWindow: parseInt(timeWindow),
+        limit: parseInt(limit),
+        skip,
+      });
+
+      // Check which posts the visitor has liked (if authenticated)
+      const likedPostIds = new Set();
+
+      if (visitorId && posts.length > 0) {
+        const postIds = posts.map((post) => post._id);
+        const likes = await Like.find({
+          user: visitorId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag to each post
+      const postsWithLikeStatus = posts.map((post) => ({
+        ...post.toObject(),
+        isLiked: likedPostIds.has(post._id.toString()),
+      }));
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+      });
+    } catch (error) {
+      console.error("Error getting viral posts:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get viral posts",
+        error: error.message,
+      });
+    }
+  },
+  /**
+   * Get post version history
+   * @route GET /api/posts/:id/versions
+   * @access Private (owner only)
+   */
+  getPostVersionHistory: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const userId = req.user.id;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId);
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check ownership
+      if (post.user.toString() !== userId && req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to view this post history",
+        });
+      }
+
+      // Get post versions
+      const PostVersion = mongoose.model("PostVersion");
+      const versions = await PostVersion.find({ post: postId }).sort({
+        createdAt: -1,
+      });
+
+      res.status(200).json({
+        success: true,
+        data: versions,
+        meta: {
+          currentVersion: post.version || 1,
+          totalVersions: versions.length + 1, // Including current version
+        },
+      });
+    } catch (error) {
+      console.error("Error getting post versions:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get post versions",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Restore a post to a previous version
+   * @route PUT /api/posts/:id/restore/:versionId
+   * @access Private (owner only)
+   */
+  restorePostVersion: async (req, res) => {
+    try {
+      const { id: postId, versionId } = req.params;
+      const userId = req.user.id;
+
+      // Check if valid ObjectIds
+      if (
+        !mongoose.Types.ObjectId.isValid(postId) ||
+        !mongoose.Types.ObjectId.isValid(versionId)
+      ) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post or version ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId);
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check ownership
+      if (post.user.toString() !== userId && req.user.role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have permission to restore this post",
+        });
+      }
+
+      // Get the version to restore
+      const PostVersion = mongoose.model("PostVersion");
+      const version = await PostVersion.findOne({
+        _id: versionId,
+        post: postId,
+      });
+
+      if (!version) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Version not found" });
+      }
+
+      // Save current version before restoring
+      await PostVersion.create({
+        post: postId,
+        caption: post.caption,
+        media: post.media,
+        hashtags: post.hashtags,
+        categories: post.categories,
+        location: post.location,
+        accessControl: post.accessControl,
+        version: post.version || 1,
+        restoredFrom: null,
+      });
+
+      // Restore the old version
+      post.caption = version.caption;
+      post.media = version.media;
+      post.hashtags = version.hashtags;
+      post.categories = version.categories;
+      post.location = version.location;
+      post.accessControl = version.accessControl;
+      post.version = (post.version || 1) + 1;
+      post.lastEditedAt = new Date();
+      post.editHistory = post.editHistory || [];
+      post.editHistory.push({
+        timestamp: new Date(),
+        action: "restored",
+        restoredFrom: version.version,
+        editor: userId,
+      });
+
+      await post.save();
+
+      // Get the updated post with populated data
+      const updatedPost = await Post.findById(postId)
+        .populate("user", "username profilePictureUrl isVerified")
+        .populate("media")
+        .populate("hashtags", "name")
+        .populate("categories", "name slug");
+
+      res.status(200).json({
+        success: true,
+        message: `Post restored to version ${version.version}`,
+        data: updatedPost,
+      });
+    } catch (error) {
+      console.error("Error restoring post version:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to restore post version",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get trending topics (combined hashtags and categories)
+   * @route GET /api/posts/trending-topics
+   * @access Public
+   */
+  getTrendingTopics: async (req, res) => {
+    try {
+      // Get limit
+      const { limit = 20, timeframe = "7d" } = req.query;
+
+      // Calculate timeframe date
+      const now = new Date();
+      let startDate;
+
+      switch (timeframe) {
+        case "24h":
+          startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          break;
+        case "7d":
+          startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          break;
+        case "30d":
+          startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+          break;
+        default:
+          startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      }
+
+      // Get trending hashtags
+      const trendingHashtags = await Hashtag.aggregate([
+        {
+          $match: {
+            lastUsed: { $gte: startDate },
+          },
+        },
+        {
+          $sort: {
+            recentUsageCount: -1,
+          },
+        },
+        {
+          $limit: parseInt(limit) / 2,
+        },
+        {
+          $project: {
+            _id: 1,
+            name: 1,
+            postCount: 1,
+            recentUsageCount: 1,
+            type: { $literal: "hashtag" },
+          },
+        },
+      ]);
+
+      // Get trending categories
+      const trendingCategories = await Category.aggregate([
+        {
+          $match: {
+            isActive: true,
+          },
+        },
+        {
+          $sort: {
+            recentPostCount: -1,
+            postCount: -1,
+          },
+        },
+        {
+          $limit: parseInt(limit) / 2,
+        },
+        {
+          $project: {
+            _id: 1,
+            name: 1,
+            slug: 1,
+            postCount: 1,
+            recentPostCount: { $ifNull: ["$recentPostCount", 0] },
+            icon: 1,
+            color: 1,
+            type: { $literal: "category" },
+          },
+        },
+      ]);
+
+      // Combine and sort
+      const combinedTopics = [...trendingHashtags, ...trendingCategories].sort(
+        (a, b) => {
+          // Sort by recent usage count
+          const aRecent = a.recentUsageCount || a.recentPostCount || 0;
+          const bRecent = b.recentUsageCount || b.recentPostCount || 0;
+          return bRecent - aRecent;
+        }
+      );
+
+      res.status(200).json({
+        success: true,
+        data: combinedTopics,
+        meta: {
+          timeframe,
+          startDate,
+          endDate: now,
+        },
+      });
+    } catch (error) {
+      console.error("Error getting trending topics:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get trending topics",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get posts by location radius
+   * @route GET /api/posts/location
+   * @access Public
+   */
+  getPostsByLocation: async (req, res) => {
+    try {
+      const { lat, lng, radius = 5, address } = req.query; // radius in km
+      const visitorId = req.user ? req.user.id : null;
+
+      if ((!lat || !lng) && !address) {
+        return res.status(400).json({
+          success: false,
+          message: "Coordinates (lat/lng) or address are required",
+        });
+      }
+
+      let coordinates;
+
+      // If address provided but no coordinates, geocode the address
+      if (address && (!lat || !lng)) {
+        try {
+          // This would use a geocoding service in a real implementation
+          // For this example, we'll assume coordinates are found
+          coordinates = [0, 0]; // Placeholder for geocoding result
+
+          // In real implementation, this would be:
+          // const geocodeResult = await geocodingService.geocode(address);
+          // coordinates = [geocodeResult.lng, geocodeResult.lat];
+        } catch (geocodeError) {
+          return res.status(400).json({
+            success: false,
+            message: "Could not geocode the provided address",
+            error: geocodeError.message,
+          });
+        }
+      } else {
+        coordinates = [parseFloat(lng), parseFloat(lat)];
+      }
+
+      // Get pagination params
+      const { page = 1, limit = 12 } = req.query;
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get sort option
+      const { sortBy = "recent" } = req.query; // 'recent', 'popular', 'distance'
+
+      // Build sort configuration
+      let sortConfig = {};
+
+      switch (sortBy) {
+        case "popular":
+          sortConfig = {
+            likes_count: -1,
+            comments_count: -1,
+            "publishingDetails.publishedAt": -1,
+          };
+          break;
+        case "distance":
+          // When using distance sorting, MongoDB will automatically sort by distance
+          // No need to specify a sort configuration
+          break;
+        default: // 'recent'
+          sortConfig = { "publishingDetails.publishedAt": -1 };
+      }
+
+      // Build location query
+      const radiusInMeters = parseFloat(radius) * 1000;
+
+      // Search posts by location
+      const query = {
+        isDeleted: false,
+        isArchived: false,
+        "accessControl.visibility": "public",
+        "publishingDetails.status": "published",
+        "location.coordinates": {
+          $near: {
+            $geometry: {
+              type: "Point",
+              coordinates: coordinates,
+            },
+            $maxDistance: radiusInMeters,
+          },
+        },
+      };
+
+      // Execute query with or without sorting
+      const posts =
+        sortBy === "distance"
+          ? await Post.find(query)
+              .skip(skip)
+              .limit(parseInt(limit))
+              .populate("user", "username profilePictureUrl isVerified")
+              .populate("media")
+              .populate("hashtags", "name")
+              .populate("categories", "name slug")
+          : await Post.find(query)
+              .sort(sortConfig)
+              .skip(skip)
+              .limit(parseInt(limit))
+              .populate("user", "username profilePictureUrl isVerified")
+              .populate("media")
+              .populate("hashtags", "name")
+              .populate("categories", "name slug");
+
+      // Get approximate total count
+      const totalCount = await Post.countDocuments(query);
+
+      // Check which posts the visitor has liked (if authenticated)
+      const likedPostIds = new Set();
+
+      if (visitorId && posts.length > 0) {
+        const postIds = posts.map((post) => post._id);
+        const likes = await Like.find({
+          user: visitorId,
+          likeableType: "Post",
+          likeableId: { $in: postIds },
+        });
+
+        likes.forEach((like) => {
+          likedPostIds.add(like.likeableId.toString());
+        });
+      }
+
+      // Add isLiked flag and distance to each post
+      const postsWithLikeStatus = posts.map((post) => {
+        // Calculate distance if the post has coordinates
+        let distance = null;
+        if (
+          post.location &&
+          post.location.coordinates &&
+          post.location.coordinates.coordinates
+        ) {
+          const postCoords = post.location.coordinates.coordinates;
+          // Simple distance calculation (not accurate for large distances)
+          const latDiff = coordinates[1] - postCoords[1];
+          const lngDiff = coordinates[0] - postCoords[0];
+          distance = Math.sqrt(latDiff * latDiff + lngDiff * lngDiff) * 111.32; // Rough conversion to km
+        }
+
+        return {
+          ...post.toObject(),
+          isLiked: likedPostIds.has(post._id.toString()),
+          distance: distance !== null ? parseFloat(distance.toFixed(2)) : null,
+        };
+      });
+
+      res.status(200).json({
+        success: true,
+        data: postsWithLikeStatus,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          totalPosts: totalCount,
+          totalPages: Math.ceil(totalCount / parseInt(limit)),
+          hasMore: skip + posts.length < totalCount,
+        },
+        meta: {
+          coordinates,
+          radiusKm: parseFloat(radius),
+          sortBy,
+        },
+      });
+    } catch (error) {
+      console.error("Error getting posts by location:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to get posts by location",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Move a post to a collection
+   * @route PUT /api/posts/:id/move-to-collection
+   * @access Private
+   */
+  movePostToCollection: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const userId = req.user.id;
+      const { sourceCollectionId, targetCollectionId } = req.body;
+
+      if (!sourceCollectionId || !targetCollectionId) {
+        return res.status(400).json({
+          success: false,
+          message: "Source and target collection IDs are required",
+        });
+      }
+
+      // Check if post exists
+      const post = await Post.findById(postId);
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check if collections exist and belong to the user
+      const Collection = mongoose.model("Collection");
+      const [sourceCollection, targetCollection] = await Promise.all([
+        Collection.findOne({ _id: sourceCollectionId, user: userId }),
+        Collection.findOne({ _id: targetCollectionId, user: userId }),
+      ]);
+
+      if (!sourceCollection) {
+        return res.status(404).json({
+          success: false,
+          message: "Source collection not found or does not belong to you",
+        });
+      }
+
+      if (!targetCollection) {
+        return res.status(404).json({
+          success: false,
+          message: "Target collection not found or does not belong to you",
+        });
+      }
+
+      // Check if post is in source collection
+      const SavedPost = mongoose.model("SavedPost");
+      const savedPost = await SavedPost.findOne({
+        user: userId,
+        post: postId,
+        collection: sourceCollectionId,
+      });
+
+      if (!savedPost) {
+        return res.status(404).json({
+          success: false,
+          message: "Post not found in the source collection",
+        });
+      }
+
+      // Check if post is already in target collection
+      const existingInTarget = await SavedPost.findOne({
+        user: userId,
+        post: postId,
+        collection: targetCollectionId,
+      });
+
+      if (existingInTarget) {
+        // Post already exists in target collection, just remove from source
+        await SavedPost.deleteOne({
+          user: userId,
+          post: postId,
+          collection: sourceCollectionId,
+        });
+
+        return res.status(200).json({
+          success: true,
+          message:
+            "Post moved to the target collection (was already in target)",
+        });
+      }
+
+      // Move post to target collection (update collection ID)
+      savedPost.collection = targetCollectionId;
+      await savedPost.save();
+
+      res.status(200).json({
+        success: true,
+        message: "Post moved to the target collection successfully",
+      });
+    } catch (error) {
+      console.error("Error moving post to collection:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to move post",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Copy a post to another collection
+   * @route POST /api/posts/:id/copy-to-collection
+   * @access Private
+   */
+  copyPostToCollection: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const userId = req.user.id;
+      const { targetCollectionId } = req.body;
+
+      if (!targetCollectionId) {
+        return res.status(400).json({
+          success: false,
+          message: "Target collection ID is required",
+        });
+      }
+
+      // Check if post exists
+      const post = await Post.findById(postId);
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check if target collection exists and belongs to the user
+      const Collection = mongoose.model("Collection");
+      const targetCollection = await Collection.findOne({
+        _id: targetCollectionId,
+        user: userId,
+      });
+
+      if (!targetCollection) {
+        return res.status(404).json({
+          success: false,
+          message: "Target collection not found or does not belong to you",
+        });
+      }
+
+      // Check if post is already in target collection
+      const SavedPost = mongoose.model("SavedPost");
+      const existingInTarget = await SavedPost.findOne({
+        user: userId,
+        post: postId,
+        collection: targetCollectionId,
+      });
+
+      if (existingInTarget) {
+        return res.status(200).json({
+          success: true,
+          message: "Post is already saved to this collection",
+        });
+      }
+
+      // Add post to target collection
+      await SavedPost.create({
+        user: userId,
+        post: postId,
+        collection: targetCollectionId,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Post copied to the target collection successfully",
+      });
+    } catch (error) {
+      console.error("Error copying post to collection:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to copy post",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Get embed code for a post
+   * @route GET /api/posts/:id/embed-code
+   * @access Public (for public posts only)
+   */
+  getPostEmbedCode: async (req, res) => {
+    try {
+      const postId = req.params.id;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId).populate(
+        "user",
+        "username profilePictureUrl isVerified"
+      );
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check if post is public
+      if (
+        post.accessControl.visibility !== "public" ||
+        post.isDeleted ||
+        post.isArchived ||
+        post.publishingDetails.status !== "published"
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Only public posts can be embedded",
+        });
+      }
+
+      // Generate embed URL
+      const baseUrl = process.env.FRONTEND_URL || "https://example.com";
+      const embedUrl = `${baseUrl}/embed/post/${postId}`;
+
+      // Generate embed code
+      const embedCode = `<iframe src="${embedUrl}" width="500" height="580" frameborder="0" scrolling="no" allowtransparency="true"></iframe>`;
+
+      // Generate og tags for SEO
+      const ogTags = `<meta property="og:title" content="Post by ${post.user.username}" />
+      <meta property="og:type" content="article" />
+      <meta property="og:url" content="${baseUrl}/post/${postId}" />
+      ${post.media && post.media.length > 0 ? `<meta property="og:image" content="${post.media[0].url}" />` : ""}
+      <meta property="og:description" content="${post.caption ? post.caption.substring(0, 150) + (post.caption.length > 150 ? "..." : "") : "View this post"}" />`;
+
+      res.status(200).json({
+        success: true,
+        data: {
+          embedCode,
+          embedUrl,
+          ogTags,
+          post: {
+            id: post._id,
+            caption: post.caption,
+            user: post.user.username,
+            profilePictureUrl: post.user.profilePictureUrl,
+            isVerified: post.user.isVerified,
+            mediaCount: post.media ? post.media.length : 0,
+          },
+        },
+      });
+    } catch (error) {
+      console.error("Error generating post embed code:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to generate embed code",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Generate shareable post URL with optional tracking parameters
+   * @route GET /api/posts/:id/share-url
+   * @access Public (for public posts only)
+   */
+  generatePostUrl: async (req, res) => {
+    try {
+      const postId = req.params.id;
+      const { utm_source, utm_medium, utm_campaign } = req.query;
+
+      // Check if valid ObjectId
+      if (!mongoose.Types.ObjectId.isValid(postId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid post ID" });
+      }
+
+      // Get post
+      const post = await Post.findById(postId);
+
+      if (!post) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Post not found" });
+      }
+
+      // Check if post is public
+      if (
+        post.accessControl.visibility !== "public" ||
+        post.isDeleted ||
+        post.isArchived ||
+        post.publishingDetails.status !== "published"
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Only public posts can be shared with a URL",
+        });
+      }
+
+      // Generate base URL
+      const baseUrl = process.env.FRONTEND_URL || "https://example.com";
+      let shareUrl = `${baseUrl}/post/${postId}`;
+
+      // Add tracking parameters if provided
+      const trackingParams = [];
+
+      if (utm_source)
+        trackingParams.push(`utm_source=${encodeURIComponent(utm_source)}`);
+      if (utm_medium)
+        trackingParams.push(`utm_medium=${encodeURIComponent(utm_medium)}`);
+      if (utm_campaign)
+        trackingParams.push(`utm_campaign=${encodeURIComponent(utm_campaign)}`);
+
+      // Add user ID as referrer if authenticated
+      if (req.user) {
+        trackingParams.push(`ref=${req.user.id}`);
+      }
+
+      // Append tracking parameters to URL
+      if (trackingParams.length > 0) {
+        shareUrl += `?${trackingParams.join("&")}`;
+      }
+
+      // Log share activity if authenticated
+      if (req.user) {
+        const Share = mongoose.model("Share");
+        await Share.create({
+          user: req.user.id,
+          post: postId,
+          platform: "link",
+          referralParams: {
+            utm_source,
+            utm_medium,
+            utm_campaign,
+          },
+        });
+
+        // Increment share count
+        await post.incrementEngagement("shares_count");
+      }
+
+      res.status(200).json({
+        success: true,
+        data: {
+          shareUrl,
+          shortUrl: shareUrl, // In a real app, this would be a shortened URL
+        },
+      });
+    } catch (error) {
+      console.error("Error generating share URL:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to generate share URL",
+        error: error.message,
+      });
+    }
+  },
+
+  /**
+   * Export posts data for a user
+   * @route GET /api/posts/export
+   * @access Private
+   */
+  exportPostsData: async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { format = "json", postIds } = req.query || {};
+
+      // Validate format
+      if (!["json", "csv"].includes(format)) {
+        return res.status(400).json({
+          success: false,
+          message: "Supported formats are json and csv",
+        });
+      }
+
+      // Build query
+      const query = { user: userId, isDeleted: false };
+
+      // If specific post IDs are provided
+      if (postIds) {
+        const postIdArray = Array.isArray(postIds)
+          ? postIds
+          : postIds.split(",");
+        query._id = { $in: postIdArray };
+      }
+
+      // Get user's posts
+      const posts = await Post.find(query)
+        .populate("hashtags", "name")
+        .populate("categories", "name")
+        .sort({ "publishingDetails.publishedAt": -1 });
+
+      if (posts.length === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "No posts found to export",
+        });
+      }
+
+      // Get engagement data
+      const postId = posts.map((post) => post._id);
+
+      const [likes, comments, shares, saves] = await Promise.all([
+        Like.countDocuments({
+          likeableType: "Post",
+          likeableId: { $in: postId },
+        }),
+        Comment.countDocuments({ post: { $in: postId } }),
+        mongoose.model("Share").countDocuments({ post: { $in: postId } }),
+        mongoose.model("SavedPost").countDocuments({ post: { $in: postId } }),
+      ]);
+
+      // Format data for export
+      let exportData;
+
+      if (format === "json") {
+        // JSON format
+        exportData = {
+          user: userId,
+          exportDate: new Date(),
+          summary: {
+            totalPosts: posts.length,
+            totalLikes: likes,
+            totalComments: comments,
+            totalShares: shares,
+            totalSaves: saves,
+          },
+          posts: posts.map((post) => {
+            const formattedPost = {
+              id: post._id,
+              caption: post.caption,
+              createdAt: post.createdAt,
+              publishedAt: post.publishingDetails.publishedAt,
+              status: post.publishingDetails.status,
+              hashTags: post.hashtags.map((tag) => tag.name),
+              categories: post.categories.map((cat) => cat.name),
+              likes: post.likes_count || 0,
+              comments: post.comments_count || 0,
+              views: post.viewsCount || 0,
+              isArchived: post.isArchived,
+              mediaCount: post.media ? post.media.length : 0,
+            };
+
+            if (post.location && post.location.name) {
+              formattedPost.location = post.location.name;
+            }
+
+            return formattedPost;
+          }),
+        };
+
+        // Set response headers
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="posts_export_${userId}_${Date.now()}.json"`
+        );
+
+        // Send JSON response
+        return res.status(200).json(exportData);
+      } else {
+        // CSV format
+        const createCsvStringifier =
+          require("csv-writer").createObjectCsvStringifier;
+
+        const csvStringifier = createCsvStringifier({
+          header: [
+            { id: "id", title: "Post ID" },
+            { id: "caption", title: "Caption" },
+            { id: "createdAt", title: "Created At" },
+            { id: "publishedAt", title: "Published At" },
+            { id: "status", title: "Status" },
+            { id: "hashTags", title: "Hashtags" },
+            { id: "categories", title: "Categories" },
+            { id: "likes", title: "Likes" },
+            { id: "comments", title: "Comments" },
+            { id: "views", title: "Views" },
+            { id: "isArchived", title: "Archived" },
+            { id: "mediaCount", title: "Media Count" },
+            { id: "location", title: "Location" },
+          ],
+        });
+
+        const records = posts.map((post) => ({
+          id: post._id.toString(),
+          caption: post.caption
+            ? post.caption.replace(/[\r\n]+/g, " ").substring(0, 100)
+            : "",
+          createdAt: post.createdAt ? post.createdAt.toISOString() : "",
+          publishedAt: post.publishingDetails.publishedAt
+            ? post.publishingDetails.publishedAt.toISOString()
+            : "",
+          status: post.publishingDetails.status,
+          hashTags: post.hashtags.map((tag) => tag.name).join(", "),
+          categories: post.categories.map((cat) => cat.name).join(", "),
+          likes: post.likes_count || 0,
+          comments: post.comments_count || 0,
+          views: post.viewsCount || 0,
+          isArchived: post.isArchived ? "Yes" : "No",
+          mediaCount: post.media ? post.media.length : 0,
+          location:
+            post.location && post.location.name ? post.location.name : "",
+        }));
+
+        const csvHeader = csvStringifier.getHeaderString();
+        const csvContent = csvStringifier.stringifyRecords(records);
+        const csvData = csvHeader + csvContent;
+
+        // Set response headers
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="posts_export_${userId}_${Date.now()}.csv"`
+        );
+
+        // Send CSV response
+        return res.status(200).send(csvData);
+      }
+    } catch (error) {
+      console.error("Error extracting user data:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to extract user data",
+        error: error.message,
+      });
+    }
+  },
+};
+
+module.exports = postController;
+
+export {
+  createPost,
+  updatePost,
+  deletePost,
+  getFeedPosts,
+  getUserPosts,
+  getPostsByHashtag,
+  getPostsByCategory,
+  getTrendingPosts,
+  toggleLike,
+  addComment,
+  getNearbyPosts,
+  getRecommendations,
+  batchProcessPosts,
+  getSavedPosts,
+  getPostById,
+  getLikedPosts,
+  savePost,
+  unsavePost,
+  approveTag,
+  rejectTag,
+  sharePost,
+  pinPost,
+  unpinPost,
+  getTagApprovals,
+  getDraftPosts,
+  reportPost,
+  getArchivedPosts,
+  getScheduledPosts,
+  suggestHashtags,
+  archivePost,
+  unarchivePost,
+  getPostAnalytics,
+  searchPosts,
+  removeTag,
+  getTaggedPosts,
+  getComments,
+  tagUser,
+  getCommentReplies,
+  replyToComment,
+  toggleCommentLike,
+  deleteComment,
+  reportComment,
+  editComment,
+  getFeaturedPosts,
+  getPostEngagement,
+  getPostReach,
+  bulkStatusUpdate,
+  getSimilarPosts,
+  getViralPosts,
+  getPostVersionHistory,
+  restorePostVersion,
+  getTrendingTopics,
+  getPostsByLocation,
+  movePostToCollection,
+  copyPostToCollection,
+  getPostEmbedCode,
+  generatePostUrl,
+  exportPostsData,
 };
